@@ -18,7 +18,7 @@ use gm::http::ContentType;
 use gm::types::messages::{Message, ImageInfo};
 use gm::types::content::{Content};
 use hyper::{Chunk, Uri};
-use gm::room::Room;
+use gm::room::{Room, RoomExt};
 use gm::errors::*;
 use gm::types::events::Event;
 use std::env;
