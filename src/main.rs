@@ -1,4 +1,4 @@
-#![feature(proc_macro, conservative_impl_trait, generators, try_trait, slice_patterns, advanced_slice_patterns)]
+#![feature(proc_macro, proc_macro_non_items, generators, try_trait, slice_patterns)]
 extern crate glitch_in_the_matrix as gm;
 extern crate futures_await as futures;
 extern crate tokio_core;
@@ -6,57 +6,108 @@ extern crate dotenv;
 extern crate serde_json;
 extern crate serde;
 extern crate hyper;
-extern crate gm_boilerplate;
 extern crate image;
 #[macro_use] extern crate serde_derive;
 extern crate tokio_timer;
 extern crate chrono;
+#[macro_use] extern crate failure;
+extern crate regex;
+#[macro_use] extern crate lazy_static;
 
 use futures::prelude::*;
 use dotenv::dotenv;
 use tokio_core::reactor::{Handle, Core};
-use gm::{MatrixClient, MatrixFuture};
+use gm::{MatrixClient};
 use gm::types::messages::Message;
-use gm::types::sync::SyncReply;
 use gm::types::content::{Content};
 use gm::room::{Room, RoomExt};
-use gm::types::messages::ImageInfo;
-use gm::errors::*;
-use gm::types::events::Event;
+use gm::sync::SyncStream;
+use gm::request::MatrixRequestable;
 use std::env;
 use std::rc::Rc;
 use std::cell::RefCell;
-use gm_boilerplate::{MatrixBot, BoilerplateConfig, make_bot_future, sync_boilerplate};
+use regex::Regex;
 
-pub type Hyper = Rc<RefCell<gm::http::MatrixHyper>>;
+pub type Hyper = Rc<RefCell<gm::MatrixHyper>>;
 pub type Mx = Rc<RefCell<MatrixClient>>;
+pub type Result<T> = ::std::result::Result<T, failure::Error>;
 
 pub mod xkcd;
 pub mod lolcount;
 pub mod inspirobot;
-pub mod wfrog;
 
-pub fn validate_response(resp: &hyper::Response) -> MatrixResult<()> {
+pub fn validate_response(resp: &hyper::Response) -> Result<()> {
     if !resp.status().is_success() {
-        Err(resp.status().canonical_reason().unwrap_or("Unknown response failure").to_string().into())
+        Err(format_err!("{}", resp.status().canonical_reason().unwrap_or("Unknown response failure")))
     }
     else {
         Ok(())
     }
 }
 pub struct XkcdBot {
-    mx: Option<Mx>,
-    hyper: Option<Hyper>,
-    hdl: Handle,
-    wfrog_rooms: Rc<RefCell<Vec<Room<'static>>>>
+    mx: Mx,
+    hyper: Hyper,
+    hdl: Handle
+}
+#[derive(Clone, Debug)]
+pub enum Command {
+    Ping,
+    Comic(Option<u32>),
+    Inspirobot,
+    SetLolcount(u32),
+    GetLolcount,
+    IncrementLolcount,
+    ParseFail
 }
 impl XkcdBot {
-    fn text_to_cmd(body: &str) -> Option<Command> {
-        let args = body.split(" ").map(|x| x.to_lowercase()).collect::<Vec<String>>();
-        let args: Vec<&str> = args.iter().map(|s| &**s).collect();
-        if args.contains(&"lol") {
-            return Some(Command::IncrementLolcount)
+    fn process_command(&self, sender: String, room: Room<'static>, cmd: Command) -> impl Future<Item = (), Error = ::failure::Error> {
+        let mut mx = self.mx.clone();
+        let h = self.hyper.clone();
+        async_block! {
+            use self::Command::*;
+
+            match cmd {
+                Ping => {
+                    await!(room.cli(&mut mx).send_simple("Pong!"))?;
+                },
+                Comic(n) => {
+                    let c = await!(xkcd::fetch_comic(h, n))?;
+                    await!(xkcd::send_comic(mx, room, c))?;
+                },
+                Inspirobot => {
+                    await!(inspirobot::inspirobot(h, mx, room))?;
+                },
+                GetLolcount => {
+                    let lols = await!(lolcount::get_lols(mx.clone(), room.clone()))?;
+                    await!(room.cli(&mut mx).send_simple(format!("lolcount: {}", lols)))?;
+                },
+                IncrementLolcount => {
+                    let lols = await!(lolcount::get_lols(mx.clone(), room.clone()))?;
+                    await!(lolcount::set_lols(mx.clone(), room.clone(), lols + 1))?;
+                    await!(room.cli(&mut mx).send_simple(format!("lolcount: {}", lols + 1)))?;
+                },
+                SetLolcount(n) => {
+                    let pl = await!(room.cli(&mut mx).get_user_power_level(sender))?;
+                    if pl < 50 {
+                        Err(format_err!("You require a power level above 50 to do that."))?;
+                    }
+                    await!(lolcount::set_lols(mx.clone(), room.clone(), n))?;
+                    await!(room.cli(&mut mx).send_simple(format!("lolcount updated - new value: {}", n)))?;
+
+                },
+                ParseFail => Err(format_err!("Failed to parse command."))?
+            }
+            Ok(())
         }
+    }
+    fn message_to_command(m: &str) -> Option<Command> {
+        lazy_static! {
+            static ref LOL_REGEX: Regex = Regex::new(r"(?i)\bl([oeu]l)+\b").unwrap();
+        }
+        if LOL_REGEX.is_match(m) {
+            return Some(Command::IncrementLolcount);
+        }
+        let args = m.split(" ").collect::<Vec<_>>();
         match &args as &[&str] {
             &["xkcd", "ping"] => Some(Command::Ping),
             &["xkcd", "latest"] => Some(Command::Comic(None)),
@@ -70,10 +121,6 @@ impl XkcdBot {
             },
             &["inspirobot"] => Some(Command::Inspirobot),
             &["lolcount"] => Some(Command::GetLolcount),
-            &["mittwoch"] => Some(Command::WfrogState),
-            &["mittwoch", "on"] | &["mittwoch", "enable"] => Some(Command::WfrogDisableEnable(true)),
-            &["mittwoch", "off"] | &["mittwoch", "disable"] => Some(Command::WfrogDisableEnable(false)),
-            &["mittwoch", "text", ref x..] => Some(Command::WfrogSetText(x.join(" ").into())),
             &["lolcount", "set", n] => {
                 if let Ok(n) = n.parse::<u32>() {
                     Some(Command::SetLolcount(n))
@@ -85,178 +132,60 @@ impl XkcdBot {
             _ => None
         }
     }
-    fn message_to_cmds(mx: Mx, room: Room<'static>, sender: String, body: &str) -> MatrixFuture<Vec<Command>> {
-        if let Some(cmd) = Self::text_to_cmd(body) {
-            Box::new(async_block! {
-                let pl = await!(room.cli(&mut mx.borrow_mut())
-                                .get_user_power_level(sender))?;
-                Ok(match cmd {
-                    cmd @ Command::WfrogDisableEnable(..) |
-                    cmd @ Command::WfrogSetText(..) => {
-                        let cmd = if pl >= 20 { cmd } else { Command::PowerLevelFail };
-                        vec![cmd]
-                    },
-                    cmd @ Command::SetLolcount(..) => {
-                        let cmd = if pl >= 50 { cmd } else { Command::PowerLevelFail };
-                        vec![cmd]
-                    },
-                    cmd => vec![cmd]
-                })
-            })
-        }
-        else {
-            Box::new(async_block! {
-                Ok(vec![])
-            })
-        }
-    }
-    #[async]
-    fn on_mittwoch(mx: Mx, room: Room<'static>, url: String, info: ImageInfo, sender: String) -> MatrixResult<Vec<Command>> {
-        let mut ret = vec![];
-        let pl = await!(room.cli(&mut mx.borrow_mut())
-                        .get_user_power_level(sender))?;
-        if pl > 20 {
-            ret.push(Command::WfrogEnable(url, info));
-        }
-        else {
-            ret.push(Command::PowerLevelFail)
-        }
-        Ok(ret)
-    }
 }
-impl MatrixBot for XkcdBot {
-    type Command = Command;
-    type SyncFuture = MatrixFuture<Vec<(Room<'static>, Self::Command)>>;
-    type CmdFuture = MatrixFuture<()>;
-    type ErrorFuture = MatrixFuture<()>;
-    fn on_login(&mut self, mx: Mx) {
-        println!("[+] Bot connected.");
-        wfrog::wfrog_init(mx.clone(), &self.hdl, self.wfrog_rooms.clone());
-        self.hyper = Some(Rc::new(RefCell::new(mx.borrow_mut().get_hyper().clone())));
-        self.mx = Some(mx);
-    }
-    fn on_sync(&mut self, reply: SyncReply) -> Self::SyncFuture {
-        for (room, _) in reply.rooms.join.iter() {
-            {
-                let mut wfr = self.wfrog_rooms.borrow_mut();
-                if !wfr.contains(room) {
-                    wfr.push(room.clone());
+fn main() -> Result<()> {
+    println!("[+] mx-xkcd-ng, an eta project");
+    println!("[+] Reading environment variables");
+    dotenv().unwrap();
+    let server = env::var("SERVER").expect("set the SERVER variable");
+    let token = env::var("ACCESS_TOKEN").expect("set the ACCESS_TOKEN variable");
+    println!("[+] Initialising tokio");
+    let mut core = Core::new()?;
+    let hdl = core.handle();
+    println!("[+] Logging in with token");
+    let mx = core.run(MatrixClient::new_from_access_token(&token, &server, &hdl))?;
+    let hyper = mx.get_hyper();
+    let mx = Rc::new(RefCell::new(mx));
+    let ss = SyncStream::new(mx.clone());
+    let mut bot = XkcdBot {
+        mx,
+        hyper: Rc::new(RefCell::new(hyper)),
+        hdl
+    };
+    let fut = ss.skip(1).for_each(|sync| {
+        for (room, evt) in sync.iter_events() {
+            if let Some(ref rd) = evt.room_data {
+                if rd.sender == bot.mx.borrow().get_user_id() {
+                    continue;
                 }
-            }
-        }
-        fn hdl(mx: Mx, r: &Room<'static>, e: &Event) -> MatrixFuture<Vec<Command>> {
-            if let Event::Full(ref meta, ref content) = *e {
-                if let Content::RoomMessage(ref m) = *content {
+                {
+                    let mut rc = room.cli(&mut bot.mx);
+                    let fut = rc.read_receipt(&rd.event_id)
+                        .map(|_| ()).map_err(|e| {
+                            eprintln!("[!] Error sending read receipt: {}", e);
+                        });
+                    bot.hdl.spawn(fut);
+                }
+                if let Content::RoomMessage(ref m) = evt.content {
                     if let Message::Text { ref body, .. } = *m {
-                        return XkcdBot::message_to_cmds(mx, r.to_owned(), meta.sender.to_owned(), body);
-                    }
-                    else if let Message::Image { ref body, ref info, ref url, .. } = *m {
-                        if body == "mittwoch.png" && info.is_some() {
-                            return Box::new(
-                                XkcdBot::on_mittwoch(mx, r.clone(), url.clone(), info.clone().unwrap(), meta.sender.clone())
-                            );
+                        if let Some(cmd) = XkcdBot::message_to_command(body) {
+                            println!("[*] Processing command: {} -> {:?}", body, cmd);
+                            let room = room.clone();
+                            let mut mx = bot.mx.clone();
+                            let fut = bot.process_command(rd.sender.clone(), room.clone(), cmd)
+                                .map_err(move |e| {
+                                    eprintln!("[!] Error processing command: {}", e);
+                                    let _ = room.cli(&mut mx).send_simple(format!("[!] error: {}", e));
+                                });
+                            bot.hdl.spawn(fut);
                         }
                     }
                 }
             }
-            Box::new(async_block! {
-                Ok(vec![])
-            })
-        };
-        sync_boilerplate(self.mx.clone().unwrap(), reply, hdl)
-    }
-    fn on_command(&mut self, room: Room<'static>, cmd: Self::Command) -> MatrixFuture<()> {
-        let mx = self.mx.clone().unwrap();
-        let hyper = self.hyper.clone().unwrap();
-        Box::new(async_block! {
-            match cmd {
-                Command::Ping => {
-                    await!(room.cli(&mut mx.borrow_mut()).send_simple("ohai"))?;
-                },
-                Command::Comic(c) => {
-                    let c = await!(xkcd::fetch_comic(hyper, c))?;
-                    await!(xkcd::send_comic(mx, room, c))?;
-                },
-                Command::Inspirobot => {
-                    await!(inspirobot::inspirobot(hyper, mx, room))?;
-                },
-                Command::GetLolcount => {
-                    let lols = await!(lolcount::get_lols(mx.clone(), room.clone()))?;
-                    await!(room.cli(&mut mx.borrow_mut())
-                           .send_simple(format!("lolcount: {}", lols)))?;
-                },
-                Command::IncrementLolcount => {
-                    let lols = await!(lolcount::get_lols(mx.clone(), room.clone()))?;
-                    await!(lolcount::set_lols(mx.clone(), room.clone(), lols + 1))?;
-                    await!(room.cli(&mut mx.borrow_mut())
-                           .send_simple(format!("lolcount: {}", lols + 1)))?;
-                },
-                Command::WfrogState => {
-                    await!(wfrog::wfrog_explain_state(mx, room))?;
-                },
-                Command::SetLolcount(n) => {
-                    await!(lolcount::set_lols(mx.clone(), room.clone(), n))?;
-                    await!(room.cli(&mut mx.borrow_mut())
-                           .send_simple(format!("lolcount updated - new value: {}", n)))?;
-                },
-                Command::WfrogDisableEnable(n) => {
-                    await!(wfrog::wfrog_disable_enable(mx, room, n))?;
-                },
-                Command::WfrogSetText(n) => {
-                    await!(wfrog::wfrog_set_text(mx, room, n))?;
-                },
-                Command::WfrogEnable(body, info) => {
-                    await!(wfrog::wfrog_set_image(mx, room, body, info))?;
-                },
-                Command::PowerLevelFail => {
-                    await!(room.cli(&mut mx.borrow_mut())
-                           .send_simple("(You can't tell me what to do!)"))?;
-                },
-                Command::ParseFail => {
-                    await!(room.cli(&mut mx.borrow_mut())
-                           .send_simple("(Parsing failed.)"))?;
-                }
-            }
-            Ok(())
-        })
-    }
-    fn on_error(&mut self, room: Option<Room<'static>>, error: MatrixError) -> Self::ErrorFuture {
-        let mx = self.mx.clone().unwrap();
-        Box::new(async_block! {
-            if let Some(rm) = room {
-                await!(rm.cli(&mut mx.borrow_mut())
-                       .send_simple(format!("[error] {}", error)))?;
-            }
-            Ok(())
-        })
-    }
-}
-#[derive(Clone)]
-pub enum Command {
-    Ping,
-    Comic(Option<u32>),
-    Inspirobot,
-    SetLolcount(u32),
-    GetLolcount,
-    IncrementLolcount,
-    WfrogState,
-    WfrogDisableEnable(bool),
-    WfrogSetText(String),
-    WfrogEnable(String, ImageInfo),
-    ParseFail,
-    PowerLevelFail
-}
-fn main() {
-    dotenv().unwrap();
-    let server = env::var("SERVER").expect("set the server variable");
-    let username = env::var("USERNAME").expect("set the username variable");
-    let password = env::var("PASSWORD").expect("set the password variable");
-    let cfg = BoilerplateConfig { server, username, password };
-    let mut core = Core::new().unwrap();
-    let hdl = core.handle();
-    let wfrog_rooms = Rc::new(RefCell::new(vec![]));
-    let bot = XkcdBot { mx: None, hyper: None, hdl: hdl.clone(), wfrog_rooms };
-    let fut = make_bot_future(hdl, cfg, bot);
+        }
+        Ok(())
+    });
     println!("[+] Starting bot!");
-    core.run(fut).unwrap();
+    core.run(fut)?;
+    Ok(())
 }
