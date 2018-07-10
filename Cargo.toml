@@ -4,7 +4,7 @@ name = "mx-xkcd-ng"
 version = "0.1.0"
 
 [dependencies]
-dotenv = "0.10"
+dotenv = "0.13"
 failure = "0.1.1"
 futures = "0.1"
 futures-await = "0.1"
